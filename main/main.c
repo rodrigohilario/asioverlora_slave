@@ -7,6 +7,7 @@
 
 #include "lora.h"
 
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -18,19 +19,20 @@
 
 /* Private definitions and enumerations */
 #define SLAVERX_MASTERTX_MSG_SIZE	2
-#define NUM_OF_SLAVES				32
 #define UART_RX_BUFFER_SIZE			256
+#define SLAVE_INPUT_0				GPIO_NUM_12
+#define SLAVE_INPUT_1				GPIO_NUM_14
+#define SLAVE_OUTPUT_2				GPIO_NUM_2
+#define SLAVE_OUTPUT_3				GPIO_NUM_4
 
 typedef enum {
-	SLAVE_ST_SLAVERX_MASTERTX = 0,
+	SLAVE_ST_IDLE_WAIT_MASTERTX = 0,
 	SLAVE_ST_CHECK_SLAVE_ADDR,
 	SLAVE_ST_PARSE_MASTER_MSG,
-	SLAVE_ST_SLAVETX_MASTERRX,
+	SLAVE_ST_SLAVE_RESPONSE,
 } slave_state_t;
 
 typedef struct {
-	bool erase_address_cmd;
-	bool available_slave;
 	bool inputs[4];
 	bool outputs[4];
 } slave_ctrl_t;
@@ -39,10 +41,9 @@ typedef struct {
 uint8_t slavetx_msg;
 uint8_t slaverx_msg[SLAVERX_MASTERTX_MSG_SIZE];
 
-slave_state_t slave_state = SLAVE_ST_SLAVERX_MASTERTX;
-slave_ctrl_t slave_ctrl[NUM_OF_SLAVES] = {0};
+slave_state_t slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
+slave_ctrl_t slave_ctrl = {0};
 bool new_message_arrived = false;
-bool set_new_slave_address_needed = false;
 uint8_t current_slave_address = 0; // TODO Use static RAM attribute
 
 /* Private functions */
@@ -56,124 +57,35 @@ void lora_rx_done_callback(uint8_t* buffer_rx, int pac_size)
 	}
 }
 
-uint8_t get_next_available_slave (uint8_t current_slave_address)
+void parse_slave_response_message (uint8_t* message)
 {
-	uint8_t next_available_slave_address = current_slave_address;
+	*message = 0;
 
-	/* Check which is the next available slave */
-	do {
-		next_available_slave_address++;
-		if (next_available_slave_address >= NUM_OF_SLAVES)
-			next_available_slave_address = 0;
-		else if (next_available_slave_address == current_slave_address)
-			return 0;
-	} while( slave_ctrl[next_available_slave_address].available_slave == false );
+	uint8_t start_bit = 0;
+	uint8_t data_bits = 0;
 
-	return next_available_slave_address;
-}
+	slave_ctrl.inputs[0] = gpio_get_level(SLAVE_INPUT_0);
+	slave_ctrl.inputs[1] = gpio_get_level(SLAVE_INPUT_1);
+	slave_ctrl.inputs[2] = 0;
+	slave_ctrl.inputs[3] = 0;
 
-bool is_erase_slave_address_needed (uint8_t slave_address)
-{
-	return slave_ctrl[slave_address].erase_address_cmd;
-}
+	data_bits |= (((uint8_t)(slave_ctrl.inputs[3])) & 0x01) << 1;
+	data_bits |= (((uint8_t)(slave_ctrl.inputs[2])) & 0x01) << 2;
+	data_bits |= (((uint8_t)(slave_ctrl.inputs[1])) & 0x01) << 3;
+	data_bits |= (((uint8_t)(slave_ctrl.inputs[0])) & 0x01) << 4;
 
-bool is_set_new_slave_address_needed ()
-{
-	return set_new_slave_address_needed;
-}
-
-void parse_io_cmd_message (uint8_t slave_address, uint8_t* message)
-{
-	uint16_t raw_message = 0;
-
-	uint16_t start_bit = 0;
-	uint16_t command_bit = 0;
-	uint16_t address_bits = ((uint16_t)slave_address) & 0x001F;
-	uint16_t data_bits = 0;
-	data_bits |= (((uint16_t)(slave_ctrl[slave_address].outputs[0])) & 0x0001) << 1;
-	data_bits |= (((uint16_t)(slave_ctrl[slave_address].outputs[1])) & 0x0001) << 2;
-	data_bits |= (((uint16_t)(slave_ctrl[slave_address].outputs[2])) & 0x0001) << 3;
-	data_bits |= (((uint16_t)(slave_ctrl[slave_address].outputs[3])) & 0x0001) << 4;
-
-	raw_message |= start_bit << 0;
-	raw_message |= command_bit << 1;
-	raw_message |= address_bits << 2;
-	raw_message |= data_bits << 7;
+	*message |= start_bit << 0;
+	*message |= data_bits << 1;
 
 	uint8_t number_of_ones = 0;
-	for (int i = 0; i < 12; i++) {
-		number_of_ones += (raw_message >> i) & 0x0001;
+	for (int i = 0; i < 5; i++) {
+		number_of_ones += (*message >> i) & 0x01;
 	}
-	uint16_t parity_bit = number_of_ones % 2; // 0 if even, 1 if odd
-	uint16_t end_bit = 1;
-	raw_message |= parity_bit << 12;
-	raw_message |= end_bit << 13;
+	uint8_t parity_bit = number_of_ones % 2; // 0 if even, 1 if odd
+	uint8_t end_bit = 1;
 
-	uint8_t lsb_message = (uint8_t)(raw_message & 0x00FF);
-	uint8_t msb_message = (uint8_t)((raw_message >> 8) & 0x00FF);
-	*message = lsb_message;
-	message++;
-	*message = msb_message;
-}
-
-void parse_erase_address_cmd_message (uint8_t slave_address, uint8_t* message)
-{
-	uint16_t raw_message = 0;
-
-	uint16_t start_bit = 0;
-	uint16_t command_bit = 1;
-	uint16_t address_bits = ((uint16_t)slave_address) & 0x001F;
-	uint16_t data_bits = 0;
-
-	raw_message |= start_bit << 0;
-	raw_message |= command_bit << 1;
-	raw_message |= address_bits << 2;
-	raw_message |= data_bits << 7;
-
-	uint8_t number_of_ones = 0;
-	for (int i = 0; i < 12; i++) {
-		number_of_ones += (raw_message >> i) & 0x0001;
-	}
-	uint16_t parity_bit = number_of_ones % 2; // 0 if even, 1 if odd
-	uint16_t end_bit = 1;
-	raw_message |= parity_bit << 12;
-	raw_message |= end_bit << 13;
-
-	uint8_t lsb_message = (uint8_t)(raw_message & 0x00FF);
-	uint8_t msb_message = (uint8_t)((raw_message >> 8) & 0x00FF);
-	*message = lsb_message;
-	message++;
-	*message = msb_message;
-}
-
-void parse_set_new_address_cmd_message (uint8_t new_slave_address, uint8_t* message)
-{
-	uint16_t raw_message = 0;
-
-	uint16_t start_bit = 0;
-	uint16_t command_bit = 0;
-	uint16_t address_bits = 0;
-	uint16_t data_bits = ((uint16_t)new_slave_address) & 0x001F;
-
-	raw_message |= start_bit << 0;
-	raw_message |= command_bit << 1;
-	raw_message |= address_bits << 2;
-	raw_message |= data_bits << 7;
-
-	uint8_t number_of_ones = 0;
-	for (int i = 0; i < 12; i++) {
-		number_of_ones += (raw_message >> i) & 0x0001;
-	}
-	uint16_t parity_bit = number_of_ones % 2; // 0 if even, 1 if odd
-	uint16_t end_bit = 1;
-	raw_message |= parity_bit << 12;
-	raw_message |= end_bit << 13;
-
-	uint8_t lsb_message = (uint8_t)(raw_message & 0x00FF);
-	uint8_t msb_message = (uint8_t)((raw_message >> 8) & 0x00FF);
-	*message = lsb_message;
-	message++;
-	*message = msb_message;
+	*message |= parity_bit << 5;
+	*message |= end_bit << 6;
 }
 
 uint8_t get_slave_address_from_master_message (uint8_t* message)
@@ -188,32 +100,68 @@ uint8_t get_slave_address_from_master_message (uint8_t* message)
 	return address_bits;
 }
 
-void parse_received_message_from_master (uint8_t slave_address, uint8_t message)
+void parse_received_message_from_master (uint8_t* message)
 {
 	uint8_t number_of_ones = 0;
-	for (int i = 0; i < 5; i++) {
-		number_of_ones += (message >> i) & 0x01;
+	uint16_t raw_message = 0;
+
+	raw_message |= ( (uint16_t)(message[0]) );
+	raw_message |= ( ( (uint16_t)(message[1]) ) << 8 );
+
+	for (int i = 0; i < 12; i++) {
+		number_of_ones += (raw_message >> i) & 0x01;
 	}
+
 	uint8_t parity_bit_calculated = number_of_ones % 2;
-	uint8_t parity_bit_from_msg = (message >> 5) & 0x01;
+	uint8_t parity_bit_from_msg = (raw_message >> 12) & 0x01;
+
+	/* Parity bit for message integrity checking */
 	if (parity_bit_from_msg == parity_bit_calculated) {
-		slave_ctrl[slave_address].inputs[0] = (bool)((message >> 1) & 0x01);
-		slave_ctrl[slave_address].inputs[1] = (bool)((message >> 2) & 0x01);
-		slave_ctrl[slave_address].inputs[2] = (bool)((message >> 3) & 0x01);
-		slave_ctrl[slave_address].inputs[3] = (bool)((message >> 4) & 0x01);
+		uint8_t command_bit = (uint8_t)( (raw_message >> 1) & 0x0001 );
+		uint8_t address_bits = (uint8_t)( (raw_message >> 2) & 0x001F );
+		uint8_t data_bits = (uint8_t)( (raw_message >> 7) & 0x001F );
+
+		if ( address_bits != 0 ) {
+			if ( command_bit == 0 ) {
+				if ( (data_bits & 0x01) == 0 ) {
+					/* Data exchange message */
+					if ( slave_ctrl.outputs[3] != ((bool)((data_bits >> 1) & 0x01)) ) {
+						slave_ctrl.outputs[3] = (bool)((data_bits >> 1) & 0x01);
+						gpio_set_level(SLAVE_OUTPUT_3, slave_ctrl.outputs[3]);
+					}
+					if ( slave_ctrl.outputs[2] != ((bool)((data_bits >> 2) & 0x01)) ) {
+						slave_ctrl.outputs[2] = (bool)((data_bits >> 2) & 0x01);
+						gpio_set_level(SLAVE_OUTPUT_2, slave_ctrl.outputs[2]);
+					}
+					if ( slave_ctrl.outputs[1] != ((bool)((data_bits >> 3) & 0x01)) ) {
+						slave_ctrl.outputs[1] = (bool)((data_bits >> 3) & 0x01);
+					}
+					if ( slave_ctrl.outputs[0] != ((bool)((data_bits >> 4) & 0x01)) ) {
+						slave_ctrl.outputs[0] = (bool)((data_bits >> 4) & 0x01);
+					}
+				}
+				else {
+					/* Parameters write message */
+					/* Future implementation */
+				}
+			}
+			else {
+				if ( data_bits == 0 ) {
+					/* Erase address command received */
+					current_slave_address = 0;
+				}
+				else {
+					/* Slave reset, I/O config, ID code, Memory Status, etc */
+				}
+			}
+		}
+		else {
+			if ( command_bit == 0) {
+				/* Set new address command received */
+				current_slave_address = data_bits;
+			}
+		}
 	}
-}
-
-void execute_user_program ()
-{
-	slave_ctrl[1].outputs[2] = slave_ctrl[2].inputs[0];
-	slave_ctrl[1].outputs[3] = slave_ctrl[3].inputs[1];
-
-	slave_ctrl[2].outputs[2] = slave_ctrl[3].inputs[0];
-	slave_ctrl[2].outputs[3] = slave_ctrl[1].inputs[1];
-
-	slave_ctrl[3].outputs[2] = slave_ctrl[1].inputs[0];
-	slave_ctrl[3].outputs[3] = slave_ctrl[2].inputs[1];
 }
 
 void uart_interface_task(void *p)
@@ -238,46 +186,24 @@ void uart_interface_task(void *p)
             data[uart_rxBytes] = 0;
 
             if ( strncmp( "ERSADDR" , (char*)data , 7 ) == 0 ) {
-            	int address_to_erase = atoi( (char*)(data + 7) );
-            	/* Check if the address is valid (1 - 31) */
-            	if ( (address_to_erase > 0) && (address_to_erase < NUM_OF_SLAVES) ) {
-            		/* Check if the slave is available in the network */
-            		if ( slave_ctrl[address_to_erase].available_slave ) {
-            			/* Check if the slave 0 isn't available in the network */
-            			if ( !(slave_ctrl[0].available_slave) ) {
-            				slave_ctrl[address_to_erase].erase_address_cmd = true;
-            				ESP_LOGI(uart_interface_task_tag, "Received Erase Address CMD: Address %i scheduled to be erased", address_to_erase);
-            			}
-            			else {
-                            ESP_LOGI(uart_interface_task_tag, "Received Erase Address CMD: Address 00 is already available");
-            			}
-            		}
-            		else {
-                        ESP_LOGI(uart_interface_task_tag, "Received Erase Address CMD: Address not available");
-            		}
+            	if ( current_slave_address != 0 ) {
+            		ESP_LOGI(uart_interface_task_tag, "Received Erase Address CMD: Erased slave address");
+            		current_slave_address = 0;
             	}
             	else {
-                    ESP_LOGI(uart_interface_task_tag, "Received Erase Address CMD: Address invalid");
+                    ESP_LOGI(uart_interface_task_tag, "Received Erase Address CMD: Address already erased");
             	}
             }
             else if ( strncmp( "SETADDR" , (char*)data , 7 ) == 0 ) {
             	int new_address_to_set = atoi( (char*)(data + 7) );
-            	/* Check if the address is valid (1 - 31) */
-            	if ( (new_address_to_set > 0) && (new_address_to_set < NUM_OF_SLAVES) ) {
-            		/* Check if the slave isn't available in the network */
-            		if ( !(slave_ctrl[new_address_to_set].available_slave) ) {
+            	if ( (new_address_to_set > 0) && (new_address_to_set < 32) ) {
+            		if ( current_slave_address == 0 ) {
             			/* Check if the slave 0 is available in the network */
-            			if (slave_ctrl[0].available_slave) {
-            				new_slave_address = (uint8_t)new_address_to_set;
-            				set_new_slave_address_needed = true;
-            				ESP_LOGI(uart_interface_task_tag, "Received Set New Address CMD: Address %i scheduled to be assigned", new_address_to_set);
-            			}
-            			else {
-                            ESP_LOGI(uart_interface_task_tag, "Received Set New Address CMD: Address 00 isn't available");
-            			}
+            			current_slave_address = (uint8_t)new_address_to_set;
+            			ESP_LOGI(uart_interface_task_tag, "Received Set New Address CMD: Address %i assigned", new_address_to_set);
             		}
             		else {
-                        ESP_LOGI(uart_interface_task_tag, "Received Set New Address CMD: Address already in use");
+                        ESP_LOGI(uart_interface_task_tag, "Received Set New Address CMD: Address must be erased before setting a new");
             		}
             	}
             	else {
@@ -299,25 +225,17 @@ void uart_interface_task(void *p)
 			printf("#ADDRESS #     INPUTS    #    OUTPUTS    #\n");
 			printf("#        # 0 # 1 # 2 # 3 # 0 # 1 # 2 # 3 #\n");
 			printf("##########################################\n");
-			if (slave_ctrl[0].available_slave) {
-				printf("#SLV 00  # Use SETADDRXX to set new addr #\n");
-				printf("##########################################\n");
-			}
-			for ( uint8_t i = 1 ; i < NUM_OF_SLAVES ; i++ ) {
-				if (slave_ctrl[i].available_slave) {
-					printf("#SLV %.2u  # %u # %u # %u # %u # %u # %u # %u # %u #\n",
-							(unsigned int)i,
-							(unsigned int)slave_ctrl[i].inputs[0],
-							(unsigned int)slave_ctrl[i].inputs[1],
-							(unsigned int)slave_ctrl[i].inputs[2],
-							(unsigned int)slave_ctrl[i].inputs[3],
-							(unsigned int)slave_ctrl[i].outputs[0],
-							(unsigned int)slave_ctrl[i].outputs[1],
-							(unsigned int)slave_ctrl[i].outputs[2],
-							(unsigned int)slave_ctrl[i].outputs[3]);
-					printf("##########################################\n");
-				}
-			}
+			printf("#SLV %.2u  # %u # %u # %u # %u # %u # %u # %u # %u #\n",
+					(unsigned int)current_slave_address,
+					(unsigned int)slave_ctrl.inputs[0],
+					(unsigned int)slave_ctrl.inputs[1],
+					(unsigned int)slave_ctrl.inputs[2],
+					(unsigned int)slave_ctrl.inputs[3],
+					(unsigned int)slave_ctrl.outputs[0],
+					(unsigned int)slave_ctrl.outputs[1],
+					(unsigned int)slave_ctrl.outputs[2],
+					(unsigned int)slave_ctrl.outputs[3]);
+			printf("##########################################\n");
 			printf(LOG_RESET_COLOR);
 		}
 
@@ -327,12 +245,11 @@ void uart_interface_task(void *p)
 
 void slave_task(void *p)
 {
-	uint32_t tick_timeout = 0;
-
 	for(;;) {
 		switch (slave_state) {
-			case SLAVE_ST_SLAVERX_MASTERTX:
-				/* If arrived new message, check if is to this slave */
+			case SLAVE_ST_IDLE_WAIT_MASTERTX:
+				/* If arrived new message, get out of the idle state and
+				 * check if is addressed to this slave */
 				if (new_message_arrived) {
 					new_message_arrived = false;
 					slave_state = SLAVE_ST_CHECK_SLAVE_ADDR;
@@ -340,9 +257,12 @@ void slave_task(void *p)
 				break;
 
 			case SLAVE_ST_CHECK_SLAVE_ADDR:
+				/* Verify if the message is addressed to THIS slave
+				 * If true, parse the message and then goes to idle state
+				 * Otherwise, goes directly to idle state */
 				if ( get_slave_address_from_master_message(slaverx_msg) != current_slave_address ) {
 					lora_receive();
-					slave_state = SLAVE_ST_SLAVERX_MASTERTX;
+					slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
 				}
 				else {
 					slave_state = SLAVE_ST_PARSE_MASTER_MSG;
@@ -350,24 +270,23 @@ void slave_task(void *p)
 				break;
 
 			case SLAVE_ST_PARSE_MASTER_MSG:
-				/* Verify if the scan is complete */
-				if (get_next_available_slave(current_slave_adress) <= current_slave_adress) {
-					slave_state = SLAVE_ST_EXEC_USER_PROGRAM;
-				}
-				else {
-					slave_state = SLAVE_ST_MASTERTX_SLAVERX;
-				}
-				current_slave_adress = get_next_available_slave(current_slave_adress);
+				parse_received_message_from_master(slaverx_msg);
+
+				slave_state = SLAVE_ST_SLAVE_RESPONSE;
 				break;
 
-			case SLAVE_ST_SLAVETX_MASTERRX:
-				execute_user_program();
-				slave_state = SLAVE_ST_MASTERTX_SLAVERX;
+			case SLAVE_ST_SLAVE_RESPONSE:
+				parse_slave_response_message(&slavetx_msg);
+				lora_send_packet(&slavetx_msg, sizeof(slavetx_msg));
+				lora_receive();
+
+				slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
 				break;
 
 			default:
 				break;
 		}
+
 		vTaskDelay(1);
 	}
 }
@@ -404,6 +323,19 @@ void app_main()
     // We won't use a buffer for sending data.
     uart_driver_install(UART_NUM_0, UART_RX_BUFFER_SIZE, 0, 0, NULL, 0);
 
+    /* Inputs and Outputs initialization */
+    gpio_pad_select_gpio(SLAVE_INPUT_0);
+    gpio_set_direction(SLAVE_INPUT_0, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(SLAVE_INPUT_0, GPIO_PULLUP_ONLY);
+    gpio_pad_select_gpio(SLAVE_INPUT_1);
+    gpio_set_direction(SLAVE_INPUT_1, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(SLAVE_INPUT_1, GPIO_PULLUP_ONLY);
+    gpio_pad_select_gpio(SLAVE_OUTPUT_2);
+    gpio_set_direction(SLAVE_OUTPUT_2, GPIO_MODE_OUTPUT);
+    gpio_pad_select_gpio(SLAVE_OUTPUT_3);
+    gpio_set_direction(SLAVE_OUTPUT_3, GPIO_MODE_OUTPUT);
+
+
     /* UART user interface task initialization */
     xTaskCreatePinnedToCore(&uart_interface_task,
     		"uart_interface",
@@ -421,16 +353,4 @@ void app_main()
 			5,
 			NULL,
 			1);
-
-//    EXAMPLE
-//    slave_ctrl[0].available_slave = true;
-//
-//    slave_ctrl[5].available_slave = true;
-//    slave_ctrl[5].inputs[1] = true;
-//    slave_ctrl[5].outputs[2] = true;
-//
-//    slave_ctrl[27].available_slave = true;
-//    slave_ctrl[27].inputs[2] = true;
-//    slave_ctrl[27].outputs[3] = true;
-
 }
