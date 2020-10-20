@@ -55,6 +55,7 @@ void lora_rx_done_callback(uint8_t* buffer_rx, int pac_size)
 		memcpy(&slaverx_msg, buffer_rx, sizeof(slaverx_msg));
 		new_message_arrived = true;
 	}
+	lora_receive_from_isr();
 }
 
 void parse_slave_response_message (uint8_t* message)
@@ -74,8 +75,8 @@ void parse_slave_response_message (uint8_t* message)
 	data_bits |= (((uint8_t)(slave_ctrl.inputs[1])) & 0x01) << 3;
 	data_bits |= (((uint8_t)(slave_ctrl.inputs[0])) & 0x01) << 4;
 
-	*message |= start_bit << 0;
-	*message |= data_bits << 1;
+	*message |= start_bit;
+	*message |= data_bits;
 
 	uint8_t number_of_ones = 0;
 	for (int i = 0; i < 5; i++) {
@@ -86,6 +87,10 @@ void parse_slave_response_message (uint8_t* message)
 
 	*message |= parity_bit << 5;
 	*message |= end_bit << 6;
+
+#ifdef DEBUG
+	printf("Sent response msg: %02X\n", (unsigned int)(*message));
+#endif
 }
 
 uint8_t get_slave_address_from_master_message (uint8_t* message)
@@ -120,6 +125,10 @@ void parse_received_message_from_master (uint8_t* message)
 		uint8_t command_bit = (uint8_t)( (raw_message >> 1) & 0x0001 );
 		uint8_t address_bits = (uint8_t)( (raw_message >> 2) & 0x001F );
 		uint8_t data_bits = (uint8_t)( (raw_message >> 7) & 0x001F );
+
+#ifdef DEBUG
+		printf("Received master msg: %04X\n", (unsigned int)(raw_message));
+#endif
 
 		if ( address_bits != 0 ) {
 			if ( command_bit == 0 ) {
@@ -181,7 +190,7 @@ void uart_interface_task(void *p)
     for (;;) {
 
     	/* UART command parser mechanism */
-        uart_rxBytes = uart_read_bytes(UART_NUM_0, data, UART_RX_BUFFER_SIZE, 100 / portTICK_RATE_MS);
+        uart_rxBytes = uart_read_bytes(UART_NUM_0, data, UART_RX_BUFFER_SIZE, 10 / portTICK_RATE_MS);
         if (uart_rxBytes > 0) {
             data[uart_rxBytes] = 0;
 
@@ -334,7 +343,6 @@ void app_main()
     gpio_set_direction(SLAVE_OUTPUT_2, GPIO_MODE_OUTPUT);
     gpio_pad_select_gpio(SLAVE_OUTPUT_3);
     gpio_set_direction(SLAVE_OUTPUT_3, GPIO_MODE_OUTPUT);
-
 
     /* UART user interface task initialization */
     xTaskCreatePinnedToCore(&uart_interface_task,
