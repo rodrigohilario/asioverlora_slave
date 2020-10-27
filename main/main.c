@@ -246,6 +246,9 @@ void uart_interface_task(void *p)
 					(unsigned int)slave_ctrl.outputs[3]);
 			printf("##########################################\n");
 			printf(LOG_RESET_COLOR);
+
+			/* To ensure that the slave don't lose too much messages */
+			lora_receive();
 		}
 
 		vTaskDelay(1);
