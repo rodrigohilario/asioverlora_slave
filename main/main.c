@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 
 /* Private definitions and enumerations */
+#define SLAVETX_MASTERRX_MSG_SIZE	2
 #define SLAVERX_MASTERTX_MSG_SIZE	2
 #define UART_RX_BUFFER_SIZE			256
 #define SLAVE_INPUT_0				GPIO_NUM_12
@@ -38,7 +39,7 @@ typedef struct {
 } slave_ctrl_t;
 
 /* Private variables */
-uint8_t slavetx_msg;
+uint8_t slavetx_msg[SLAVETX_MASTERRX_MSG_SIZE];
 uint8_t slaverx_msg[SLAVERX_MASTERTX_MSG_SIZE];
 
 slave_state_t slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
@@ -51,8 +52,8 @@ void lora_rx_done_callback(uint8_t* buffer_rx, int pac_size)
 {
 	/* Slave must receive packets only from the Master */
 	if ( pac_size == 2 ){
-		memset(&slaverx_msg, 0, sizeof(slaverx_msg));
-		memcpy(&slaverx_msg, buffer_rx, sizeof(slaverx_msg));
+		memset(slaverx_msg, 0, sizeof(slaverx_msg));
+		memcpy(slaverx_msg, buffer_rx, sizeof(slaverx_msg));
 		new_message_arrived = true;
 	}
 	lora_receive_from_isr();
@@ -60,7 +61,8 @@ void lora_rx_done_callback(uint8_t* buffer_rx, int pac_size)
 
 void parse_slave_response_message (uint8_t* message)
 {
-	*message = 0;
+	message[0] = 0;
+	message[1] = 0;
 
 	uint8_t start_bit = 0;
 	uint8_t data_bits = 0;
@@ -95,6 +97,10 @@ void parse_slave_response_message (uint8_t* message)
 
 uint8_t get_slave_address_from_master_message (uint8_t* message)
 {
+	/* Message from another slave, does not parse it */
+	if ( (message[1]) == 0 )
+		return 0xFF;
+
 	uint16_t raw_message = 0;
 
 	raw_message |= ( (uint16_t)(message[0]) );
@@ -113,6 +119,9 @@ void parse_received_message_from_master (uint8_t* message)
 	raw_message |= ( (uint16_t)(message[0]) );
 	raw_message |= ( ( (uint16_t)(message[1]) ) << 8 );
 
+	uint16_t start_bit = (raw_message) & 0x0001;
+	uint16_t end_bit = (raw_message >> 13) & 0x0001;
+
 	for (int i = 0; i < 12; i++) {
 		number_of_ones += (raw_message >> i) & 0x01;
 	}
@@ -121,7 +130,8 @@ void parse_received_message_from_master (uint8_t* message)
 	uint8_t parity_bit_from_msg = (raw_message >> 12) & 0x01;
 
 	/* Parity bit for message integrity checking */
-	if (parity_bit_from_msg == parity_bit_calculated) {
+	if ( (start_bit == 0) && (end_bit == 1) &&
+				(parity_bit_from_msg == parity_bit_calculated) ) {
 		uint8_t command_bit = (uint8_t)( (raw_message >> 1) & 0x0001 );
 		uint8_t address_bits = (uint8_t)( (raw_message >> 2) & 0x001F );
 		uint8_t data_bits = (uint8_t)( (raw_message >> 7) & 0x001F );
@@ -190,7 +200,7 @@ void uart_interface_task(void *p)
     for (;;) {
 
     	/* UART command parser mechanism */
-        uart_rxBytes = uart_read_bytes(UART_NUM_0, data, UART_RX_BUFFER_SIZE, 10 / portTICK_RATE_MS);
+        uart_rxBytes = uart_read_bytes(UART_NUM_0, data, UART_RX_BUFFER_SIZE, 1 / portTICK_RATE_MS);
         if (uart_rxBytes > 0) {
             data[uart_rxBytes] = 0;
 
@@ -257,14 +267,19 @@ void uart_interface_task(void *p)
 
 void slave_task(void *p)
 {
+//	uint32_t schedule_lora_receive = xTaskGetTickCount();
 	for(;;) {
 		switch (slave_state) {
 			case SLAVE_ST_IDLE_WAIT_MASTERTX:
 				/* If arrived new message, get out of the idle state and
 				 * check if is addressed to this slave */
 				if (new_message_arrived) {
+//					printf("RX: %02X%02X\n", slaverx_msg[1], slaverx_msg[0]);
 					new_message_arrived = false;
 					slave_state = SLAVE_ST_CHECK_SLAVE_ADDR;
+				}
+				else {
+					vTaskDelay(1);
 				}
 				break;
 
@@ -273,7 +288,6 @@ void slave_task(void *p)
 				 * If true, parse the message and then goes to idle state
 				 * Otherwise, goes directly to idle state */
 				if ( get_slave_address_from_master_message(slaverx_msg) != current_slave_address ) {
-					lora_receive();
 					slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
 				}
 				else {
@@ -288,8 +302,11 @@ void slave_task(void *p)
 				break;
 
 			case SLAVE_ST_SLAVE_RESPONSE:
-				parse_slave_response_message(&slavetx_msg);
-				lora_send_packet(&slavetx_msg, sizeof(slavetx_msg));
+				parse_slave_response_message(slavetx_msg);
+//				printf("TX: %02X%02X\n", slavetx_msg[1], slavetx_msg[0]);
+
+				vTaskDelay(1);
+				lora_send_packet(slavetx_msg, sizeof(slavetx_msg));
 				lora_receive();
 
 				slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
@@ -298,8 +315,6 @@ void slave_task(void *p)
 			default:
 				break;
 		}
-
-		vTaskDelay(1);
 	}
 }
 
@@ -317,8 +332,10 @@ void app_main()
 	lora_init();
 	lora_set_frequency(915e6);
 	lora_set_bandwidth(500e3);
-	lora_set_spreading_factor(7);
-	lora_enable_crc();
+	lora_set_spreading_factor(6);
+	lora_implicit_header_mode(2);
+	lora_set_preamble_length(8);
+	lora_disable_crc();
 	lora_onReceive(&lora_rx_done_callback);
 	lora_receive();
 
