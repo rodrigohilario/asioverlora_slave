@@ -29,6 +29,7 @@ float lora_packet_snr(void);
 void lora_close(void);
 int lora_initialized(void);
 void lora_dump_registers(void);
+void lora_write_reg(int reg, int val);
 
 /* Callbacks test */
 void lora_onReceive(void(*callback)(uint8_t*, int));

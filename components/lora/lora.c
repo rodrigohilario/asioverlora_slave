@@ -103,16 +103,16 @@ lora_write_reg(int reg, int val)
 			.rx_buffer = in
 	};
 
-	gpio_set_level(CONFIG_CS_GPIO, 0);
 	if( semaphore_lora != NULL )
 	{
 		if( xSemaphoreTake( semaphore_lora, portMAX_DELAY ) == pdTRUE )
 		{
+			gpio_set_level(CONFIG_CS_GPIO, 0);
 			spi_device_transmit(__spi, &t);
 			xSemaphoreGive( semaphore_lora );
+			gpio_set_level(CONFIG_CS_GPIO, 1);
 		}
 	}
-	gpio_set_level(CONFIG_CS_GPIO, 1);
 }
 
 /**
@@ -133,17 +133,17 @@ lora_write_reg_from_isr(int reg, int val)
 			.rx_buffer = in
 	};
 
-	gpio_set_level(CONFIG_CS_GPIO, 0);
 	if( semaphore_lora != NULL )
 	{
 		BaseType_t xTaskWokenByReceive = pdFALSE;
 		if( xSemaphoreTakeFromISR( semaphore_lora, &xTaskWokenByReceive ) == pdTRUE )
 		{
+			gpio_set_level(CONFIG_CS_GPIO, 0);
 			spi_device_polling_transmit(__spi, &t);
 			xSemaphoreGiveFromISR( semaphore_lora, &xTaskWokenByReceive );
+			gpio_set_level(CONFIG_CS_GPIO, 1);
 		}
 	}
-	gpio_set_level(CONFIG_CS_GPIO, 1);
 }
 
 /**
@@ -164,16 +164,16 @@ lora_read_reg(int reg)
 			.rx_buffer = in
 	};
 
-	gpio_set_level(CONFIG_CS_GPIO, 0);
 	if( semaphore_lora != NULL )
 	{
 		if( xSemaphoreTake( semaphore_lora, portMAX_DELAY ) == pdTRUE )
 		{
+			gpio_set_level(CONFIG_CS_GPIO, 0);
 			spi_device_transmit(__spi, &t);
 			xSemaphoreGive( semaphore_lora );
+			gpio_set_level(CONFIG_CS_GPIO, 1);
 		}
 	}
-	gpio_set_level(CONFIG_CS_GPIO, 1);
 	return in[1];
 }
 
@@ -195,17 +195,17 @@ lora_read_reg_from_isr(int reg)
 			.rx_buffer = in
 	};
 
-	gpio_set_level(CONFIG_CS_GPIO, 0);
 	if( semaphore_lora != NULL )
 	{
 		BaseType_t xTaskWokenByReceive = pdFALSE;
 		if( xSemaphoreTakeFromISR( semaphore_lora, &xTaskWokenByReceive ) == pdTRUE )
 		{
+			gpio_set_level(CONFIG_CS_GPIO, 0);
 			spi_device_polling_transmit(__spi, &t);
 			xSemaphoreGiveFromISR( semaphore_lora, &xTaskWokenByReceive );
+			gpio_set_level(CONFIG_CS_GPIO, 1);
 		}
 	}
-	gpio_set_level(CONFIG_CS_GPIO, 1);
 	return in[1];
 }
 

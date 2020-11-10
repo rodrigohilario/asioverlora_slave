@@ -45,7 +45,9 @@ uint8_t slaverx_msg[SLAVERX_MASTERTX_MSG_SIZE];
 slave_state_t slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
 slave_ctrl_t slave_ctrl = {0};
 bool new_message_arrived = false;
-uint8_t current_slave_address = 0; // TODO Use static RAM attribute
+uint8_t current_slave_address = 0;
+uint32_t last_msg_received_tick = 0;
+uint32_t refresh_count = 0;
 
 /* Private functions */
 void lora_rx_done_callback(uint8_t* buffer_rx, int pac_size)
@@ -255,10 +257,25 @@ void uart_interface_task(void *p)
 					(unsigned int)slave_ctrl.outputs[2],
 					(unsigned int)slave_ctrl.outputs[3]);
 			printf("##########################################\n");
+			printf("#     REFRESH COUNT:     %6u          #\n", (unsigned int)refresh_count);
+			printf("##########################################\n");
 			printf(LOG_RESET_COLOR);
 
 			/* To ensure that the slave don't lose too much messages */
-			lora_receive();
+//			lora_receive();
+		}
+
+		if (last_msg_received_tick > 0) {
+			if (xTaskGetTickCount() - last_msg_received_tick >= pdMS_TO_TICKS(2000)) {
+				last_msg_received_tick = xTaskGetTickCount();
+				lora_sleep();
+				lora_idle();
+				lora_write_reg(0x0f, 0);
+				lora_write_reg(0x0e, 0);
+				lora_receive();
+				printf("Long timeout, refresh some registers\n");
+				refresh_count++;
+			}
 		}
 
 		vTaskDelay(1);
@@ -292,6 +309,7 @@ void slave_task(void *p)
 				}
 				else {
 					slave_state = SLAVE_ST_PARSE_MASTER_MSG;
+					last_msg_received_tick = xTaskGetTickCount();
 				}
 				break;
 
@@ -305,9 +323,11 @@ void slave_task(void *p)
 				parse_slave_response_message(slavetx_msg);
 //				printf("TX: %02X%02X\n", slavetx_msg[1], slavetx_msg[0]);
 
-				vTaskDelay(1);
-				lora_send_packet(slavetx_msg, sizeof(slavetx_msg));
-				lora_receive();
+//				vTaskDelay(1);
+				lora_set_preamble_length(10);
+				lora_send_packet_with_tx_done(slavetx_msg, sizeof(slavetx_msg));
+				lora_set_preamble_length(8);
+//				lora_receive();
 
 				slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
 				break;
@@ -337,6 +357,7 @@ void app_main()
 	lora_set_preamble_length(8);
 	lora_disable_crc();
 	lora_onReceive(&lora_rx_done_callback);
+	lora_onTxDone(&lora_receive_from_isr);
 	lora_receive();
 
 	/* UART interface initialization */
@@ -369,7 +390,7 @@ void app_main()
     		"uart_interface",
 			8192,
 			NULL,
-			6, // TODO Analyze the possible use of configMAX_PRIORITIES
+			0, // TODO Analyze the possible use of configMAX_PRIORITIES
 			NULL,
 			1);
 
@@ -378,7 +399,7 @@ void app_main()
 			"slave",
 			8192,
 			NULL,
-			5,
+			0,
 			NULL,
-			1);
+			0);
 }
