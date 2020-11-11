@@ -45,7 +45,7 @@ uint8_t slaverx_msg[SLAVERX_MASTERTX_MSG_SIZE];
 slave_state_t slave_state = SLAVE_ST_IDLE_WAIT_MASTERTX;
 slave_ctrl_t slave_ctrl = {0};
 bool new_message_arrived = false;
-uint8_t current_slave_address = 0;
+uint8_t current_slave_address = 1;
 uint32_t last_msg_received_tick = 0;
 uint32_t refresh_count = 0;
 
